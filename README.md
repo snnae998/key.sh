@@ -4,7 +4,7 @@
 
 [![Shell](https://img.shields.io/badge/Shell-Bash-4EAA25?logo=gnu-bash&logoColor=white)](#)
 [![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black)](#)
-![GitHub Stars](https://img.shields.io/github/stars/BeacherZ/key.sh?style=flat-square)
+![GitHub Stars](https://img.shields.io/github/stars/snnae998/key.sh?style=flat-square)
 
 </div>
 
