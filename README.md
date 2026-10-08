@@ -31,7 +31,7 @@ Debian · Ubuntu · RHEL · CentOS · Rocky · AlmaLinux · Fedora · Oracle · 
 ## 🚀 快速开始
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/BeacherZ/key.sh/main/key.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/snnae998/key.sh/main/key.sh)
 ```
 
 > 需要 root 权限或 sudo，首次运行自动安装缺失依赖。
