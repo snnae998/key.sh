@@ -12,6 +12,12 @@ GRAY="\033[90m"; BOLD="\033[1m"; RESET="\033[0m"
 
 INFO="${GREEN}[INFO]${RESET}"; WARN="${YELLOW}[WARN]${RESET}"; ERROR="${RED}[ERROR]${RESET}"
 
+# 需要 bash（数组、${var,,})；busybox ash / dash 下会直接报语法错，这里给出明确提示
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "本脚本需要使用 bash 运行（Alpine 请先执行: apk add bash）" >&2
+    exit 1
+fi
+
 JAIL_CONF="/etc/fail2ban/jail.local"
 LOG_FILE="/var/log/fail2ban.log"
 TARGET_JAIL="sshd"
@@ -21,14 +27,32 @@ SSHD_CONF_DIR="/etc/ssh/sshd_config.d"
 SSHD_CUSTOM="${SSHD_CONF_DIR}/00-key.sh.conf"
 SSHD_LEGACY="${SSHD_CONF_DIR}/99-key.sh.conf"
 
-[ "$EUID" -ne 0 ] && SUDO="sudo" || SUDO=""
+if [ "$EUID" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
 PKG_MGR=""; INIT_SYS=""; SSH_LOG=""; OS_NAME=""; OS_ID=""; OS_VER=""; OS_SHORT=""
+_INCLUDE_WARNED=0; MASK_SSH_SOCKET=0
+_SSHD_T_CACHE=""; _SSHD_T_READY=0
+
+# 提权前置检查：非 root 且无 sudo 时直接退出，避免所有系统命令静默失败
+# sudo -v 顺便验证"能否真的提权"（需要密码时在这里一次性提示），
+# 否则 check_dependencies 里的 apt/dnf 会静默失败，直到改配置才发现没权限
+require_privilege() {
+    if [ "$EUID" -eq 0 ]; then return 0; fi
+    if ! command -v sudo &>/dev/null; then
+        echo -e "${ERROR} 当前不是 root 用户，且系统未安装 sudo，无法修改配置。"
+        echo -e "${YELLOW}请改用 root 用户运行本脚本。${RESET}"
+        exit 1
+    fi
+    if ! sudo -v; then
+        echo -e "${ERROR} sudo 认证失败，无法提权执行系统命令。"
+        echo -e "${YELLOW}请确认当前用户在 sudo 组内，或改用 root 用户运行本脚本。${RESET}"
+        exit 1
+    fi
+}
 
 # ============ 命令行帮助 ============
-case "${1:-}" in
-    -h|--help)
-        cat <<HELP
+show_help() {
+cat <<HELP
 SSH Security Installer
 
 用法:
@@ -48,7 +72,10 @@ SSH Security Installer
 其他:
   -h, --help     显示帮助
 HELP
-        exit 0 ;;
+}
+
+case "${1:-}" in
+    -h|--help) show_help; exit 0 ;;
 esac
 
 # ============ 能力检测 ============
@@ -110,11 +137,13 @@ detect_ssh_log() {
 }
 
 # ============ 服务管理抽象 ============
-svc_start()  { case "$INIT_SYS" in systemd) $SUDO systemctl start "$1" 2>/dev/null;; openrc) $SUDO rc-service "$1" start 2>/dev/null;; sysvinit) $SUDO service "$1" start 2>/dev/null;; esac; }
-svc_stop()   { case "$INIT_SYS" in systemd) $SUDO systemctl stop "$1" 2>/dev/null;; openrc) $SUDO rc-service "$1" stop 2>/dev/null;; sysvinit) $SUDO service "$1" stop 2>/dev/null;; esac; }
-svc_restart(){ case "$INIT_SYS" in systemd) $SUDO systemctl restart "$1" 2>/dev/null;; openrc) $SUDO rc-service "$1" restart 2>/dev/null;; sysvinit) $SUDO service "$1" restart 2>/dev/null;; esac; }
-svc_enable() { case "$INIT_SYS" in systemd) $SUDO systemctl enable "$1" 2>/dev/null;; openrc) $SUDO rc-update add "$1" default 2>/dev/null;; sysvinit) $SUDO update-rc.d "$1" defaults 2>/dev/null || chkconfig "$1" on 2>/dev/null;; esac; }
-svc_disable(){ case "$INIT_SYS" in systemd) $SUDO systemctl disable "$1" 2>/dev/null;; openrc) $SUDO rc-update del "$1" default 2>/dev/null;; sysvinit) $SUDO update-rc.d -f "$1" remove 2>/dev/null || chkconfig "$1" off 2>/dev/null;; esac; }
+# 注意：每个分支都必须有兜底返回 1。否则 INIT_SYS 为 unknown（容器、chroot、
+# 非标准 init）时 case 不匹配会返回 0，调用方会把"什么都没做"当成"启动成功"
+svc_start()  { case "$INIT_SYS" in systemd) $SUDO systemctl start "$1" 2>/dev/null;; openrc) $SUDO rc-service "$1" start 2>/dev/null;; sysvinit) $SUDO service "$1" start 2>/dev/null;; *) return 1;; esac; }
+svc_stop()   { case "$INIT_SYS" in systemd) $SUDO systemctl stop "$1" 2>/dev/null;; openrc) $SUDO rc-service "$1" stop 2>/dev/null;; sysvinit) $SUDO service "$1" stop 2>/dev/null;; *) return 1;; esac; }
+svc_restart(){ case "$INIT_SYS" in systemd) $SUDO systemctl restart "$1" 2>/dev/null;; openrc) $SUDO rc-service "$1" restart 2>/dev/null;; sysvinit) $SUDO service "$1" restart 2>/dev/null;; *) return 1;; esac; }
+svc_enable() { case "$INIT_SYS" in systemd) $SUDO systemctl enable "$1" 2>/dev/null;; openrc) $SUDO rc-update add "$1" default 2>/dev/null;; sysvinit) $SUDO update-rc.d "$1" defaults 2>/dev/null || chkconfig "$1" on 2>/dev/null;; *) return 1;; esac; }
+svc_disable(){ case "$INIT_SYS" in systemd) $SUDO systemctl disable "$1" 2>/dev/null;; openrc) $SUDO rc-update del "$1" default 2>/dev/null;; sysvinit) $SUDO update-rc.d -f "$1" remove 2>/dev/null || chkconfig "$1" off 2>/dev/null;; *) return 1;; esac; }
 
 # ============ 包管理抽象 ============
 pkg_install() {
@@ -123,14 +152,14 @@ pkg_install() {
         dnf) $SUDO dnf install -y "$@" ;;
         yum) $SUDO yum install -y "$@" ;;
         zypper) $SUDO zypper --non-interactive install "$@" ;;
-        pacman) $SUDO pacman -Sy --noconfirm "$@" ;;
+        pacman) $SUDO pacman -S --noconfirm "$@" ;;
         apk) $SUDO apk add --no-cache "$@" ;;
         *) echo -e "${ERROR} 未知包管理器"; return 1 ;;
     esac
 }
 pkg_remove() {
     case "$PKG_MGR" in
-        apt) $SUDO apt-get remove --purge -y "$@"; $SUDO apt-get autoremove -y ;;
+        apt) $SUDO apt-get remove --purge -y "$@" ;;
         dnf) $SUDO dnf remove -y "$@" ;;
         yum) $SUDO yum remove -y "$@" ;;
         zypper) $SUDO zypper --non-interactive remove "$@" ;;
@@ -190,14 +219,42 @@ check_eol_system() {
 }
 
 # ============ SSH 配置管理 ============
-# 读取顺序：优先读 00-key.sh.conf（我们写入的地方）→ 主文件 → 其他 .d 文件
-# 与 OpenSSH "First Match Wins" 生效顺序一致
+# 用 sshd -T 拿一次"最终生效配置"并缓存，避免自己 grep 时漏掉 Include 的解析规则
+# 注意：非 root 时 sshd -T 会因权限不足失败，只在能免密提权时才尝试，
+#       避免刷新状态面板时突然弹出 sudo 密码提示
+ssh_effective_dump() {
+    [ "$_SSHD_T_READY" -eq 1 ] && return 0
+    _SSHD_T_READY=1
+    local bin=""
+    if command -v sshd &>/dev/null; then bin="sshd"
+    elif [ -x /usr/sbin/sshd ]; then bin="/usr/sbin/sshd"
+    fi
+    [ -z "$bin" ] && return 1
+    local out=""
+    if [ "$EUID" -eq 0 ]; then
+        out=$("$bin" -T 2>/dev/null) || return 1
+    else
+        $SUDO -n true 2>/dev/null || return 1
+        out=$($SUDO "$bin" -T 2>/dev/null) || return 1
+    fi
+    [ -z "$out" ] && return 1
+    _SSHD_T_CACHE="$out"
+    return 0
+}
+
+# 读取顺序：sshd -T 生效值 → 00-key.sh.conf → 主文件 → 其他 .d 文件
+# grep 兜底部分与 OpenSSH "First Match Wins" 生效顺序一致
 get_sshd_config_val() {
     local key="$1" default_val="$2"
     local val=""
 
+    # 0. 优先取真实生效值（Include 进来的配置也算数，面板不会与实际不一致）
+    if ssh_effective_dump; then
+        val=$(printf '%s\n' "$_SSHD_T_CACHE" | awk -v k="$key" 'tolower($1)==tolower(k){v=$2} END{if(v!="")print v}')
+    fi
+
     # 1. 优先读取我们写入的 00-key.sh.conf
-    if [ -f "$SSHD_CUSTOM" ]; then
+    if [ -z "$val" ] && [ -f "$SSHD_CUSTOM" ]; then
         val=$(grep -iE "^[[:space:]]*${key}[[:space:]=]+" "$SSHD_CUSTOM" | tail -n 1 | \
               sed -E 's/^[[:space:]]*[^[:space:]=]+[[:space:]=]+//' | awk '{print $1}')
     fi
@@ -223,26 +280,68 @@ get_sshd_config_val() {
     echo "$default_val"
 }
 
+# 判断主配置是否真的加载了 sshd_config.d（否则写进 .d 的文件完全不生效）
+sshd_includes_conf_dir() {
+    [ -d "$SSHD_CONF_DIR" ] || return 1
+    grep -qiE "^[[:space:]]*Include[[:space:]]+.*sshd_config\.d" "$SSHD_MAIN" 2>/dev/null
+}
+
+# 注释掉某参数，保留原值以便回滚；已带标记的行不重复处理（幂等）
+# 关键：第一个 Match 块之后的行一律不动，避免把按用户/组写的差异化配置注释掉
+comment_param_in_file() {
+    local param="$1" file="$2"
+    [ -f "$file" ] && [ -s "$file" ] || return 0
+    local tmpf; tmpf=$(mktemp)
+    awk -v p="${param}" '
+        BEGIN { inm=0 }
+        tolower($0) ~ /^[[:space:]]*match[[:space:]]/ { inm=1 }
+        inm { print; next }
+        $0 ~ /disabled by key\.sh/ { print; next }
+        $0 ~ ("^[[:space:]]*#?[[:space:]]*" p "[[:space:]=][[:space:]]*.*$") {
+            line = $0
+            sub(/^[[:space:]]*#?[[:space:]]*/, "", line)
+            sub(/^[^[:space:]=]+[[:space:]=][[:space:]]*/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line == "") print "# " p " (disabled by key.sh)"
+            else print "# " p " " line " (disabled by key.sh)"
+            next
+        }
+        { print }
+    ' "$file" > "$tmpf"
+    if [ -s "$tmpf" ]; then
+        $SUDO cp "$tmpf" "$file"
+    fi
+    rm -f "$tmpf"
+}
+
 # 写入 SSH 配置
 # 优先写入 00-key.sh.conf（字典序最靠前 = 最高优先级 + 避开 Match 块陷阱）
 # 无 sshd_config.d 目录时才写主文件
 set_sshd_config() {
     local param="$1" value="$2"
+    local use_conf_dir=0
 
     if [ -d "$SSHD_CONF_DIR" ]; then
+        if sshd_includes_conf_dir; then
+            use_conf_dir=1
+        elif [ "$_INCLUDE_WARNED" -ne 1 ]; then
+            echo -e "${WARN} 主配置未加载 ${SSHD_CONF_DIR}，本次改为直接写入主配置文件。"
+            _INCLUDE_WARNED=1
+        fi
+    fi
+
+    if [ "$use_conf_dir" -eq 1 ]; then
         # 0. 清理旧版遗留的 99-key.sh.conf（防重复）
         if [ -f "$SSHD_LEGACY" ]; then
             $SUDO rm -f "$SSHD_LEGACY"
         fi
         # 1. 注释主文件中的同参数项（防御 Include 在文件末尾的边界情况）
-        if [ -f "$SSHD_MAIN" ]; then
-            $SUDO sed -i -E "s/^[[:space:]]*#?[[:space:]]*(${param})[[:space:]=].*/# \1 (disabled by key.sh)/" "$SSHD_MAIN"
-        fi
+        comment_param_in_file "$param" "$SSHD_MAIN"
         # 2. 注释其他 .conf 中的同参数项，避免 First Match Wins 冲突
         for conf in "${SSHD_CONF_DIR}"/*.conf; do
             [ -f "$conf" ] || continue
             [ "$conf" = "$SSHD_CUSTOM" ] && continue
-            $SUDO sed -i -E "s/^[[:space:]]*#?[[:space:]]*(${param})[[:space:]=].*/# \1 (disabled by key.sh)/" "$conf"
+            comment_param_in_file "$param" "$conf"
         done
         # 3. 确保自定义文件存在
         [ ! -f "$SSHD_CUSTOM" ] && echo "${param} ${value}" | $SUDO tee "$SSHD_CUSTOM" > /dev/null
@@ -250,31 +349,42 @@ set_sshd_config() {
         $SUDO sed -i -E "/^[[:space:]]*#?[[:space:]]*(${param})[[:space:]=]/d" "$SSHD_CUSTOM"
         echo "${param} ${value}" | $SUDO tee -a "$SSHD_CUSTOM" > /dev/null
     else
-        # 传统主文件模式（无 sshd_config.d 目录的老系统）
-        $SUDO sed -i -E "/^[[:space:]]*#?[[:space:]]*(${param})[[:space:]=]/d" "$SSHD_MAIN"
-        if grep -q -iE "^[[:space:]]*Match[[:space:]]+" "$SSHD_MAIN"; then
-            # 存在 Match 块，插入到第一个 Match 之前（大小写不敏感）
-            local tmpf; tmpf=$(mktemp)
-            awk -v p="${param}" -v v="${value}" '
-                BEGIN { inserted=0 }
-                tolower($0) ~ /^[[:space:]]*match[[:space:]]/ && !inserted {
-                    print p " " v
-                    inserted=1
-                }
-                { print }
-            ' "$SSHD_MAIN" > "$tmpf"
+        # 传统主文件模式（无 sshd_config.d 目录，或主配置未加载 .d 目录）
+        # 只处理第一个 Match 之前的全局段，Match 块内的同名参数原样保留
+        [ -f "$SSHD_MAIN" ] || { echo -e "${ERROR} 找不到 ${SSHD_MAIN}"; return 1; }
+        local tmpf; tmpf=$(mktemp)
+        awk -v p="${param}" -v v="${value}" '
+            BEGIN { inm=0; inserted=0 }
+            tolower($0) ~ /^[[:space:]]*match[[:space:]]/ {
+                if (!inserted) { print p " " v; inserted=1 }
+                inm=1
+            }
+            !inm && $0 ~ ("^[[:space:]]*#?[[:space:]]*" p "[[:space:]=]") { next }
+            { print }
+            END { if (!inserted) print p " " v }
+        ' "$SSHD_MAIN" > "$tmpf"
+        if [ -s "$tmpf" ]; then
             $SUDO cp "$tmpf" "$SSHD_MAIN"
-            rm -f "$tmpf"
         else
-            echo "${param} ${value}" | $SUDO tee -a "$SSHD_MAIN" > /dev/null
+            echo -e "${ERROR} 写入 ${SSHD_MAIN} 失败。"
+            rm -f "$tmpf"
+            return 1
         fi
+        rm -f "$tmpf"
     fi
+    # 配置已变，作废 sshd -T 缓存，下次读取重新解析
+    _SSHD_T_CACHE=""; _SSHD_T_READY=0
 }
 
 restart_sshd() {
     echo -e "${INFO} 正在检测 SSH 配置文件语法..."
-    if command -v sshd &>/dev/null; then
-        if ! $SUDO sshd -t; then
+    # 非 root 时 /usr/sbin 可能不在 PATH，显式兜底，避免跳过语法检查
+    local sshd_bin=""
+    if command -v sshd &>/dev/null; then sshd_bin="sshd"
+    elif [ -x /usr/sbin/sshd ]; then sshd_bin="/usr/sbin/sshd"
+    fi
+    if [ -n "$sshd_bin" ]; then
+        if ! $SUDO "$sshd_bin" -t; then
             echo -e "${ERROR} SSH 配置文件测试失败！检测到语法错误，已取消重启以防止断连锁死！"
             return 1
         fi
@@ -283,11 +393,13 @@ restart_sshd() {
     echo -e "${INFO} 正在重启 SSH 服务..."
     local restart_ok=1
     if [ "$INIT_SYS" = "systemd" ]; then
-        if systemctl list-unit-files 2>/dev/null | grep -q "ssh.socket"; then
+        # 仅在改端口时处理 socket 激活，避免无关操作永久改变系统行为
+        if [ "$MASK_SSH_SOCKET" -eq 1 ] && systemctl list-unit-files 2>/dev/null | grep -q "ssh.socket"; then
             echo -e "${INFO} 检测到 systemd ssh.socket，正在强制关闭并屏蔽 (mask)..."
             $SUDO systemctl stop ssh.socket &>/dev/null
             $SUDO systemctl disable ssh.socket &>/dev/null
             $SUDO systemctl mask ssh.socket &>/dev/null
+            echo -e "${GRAY}如需恢复 socket 激活：systemctl unmask ssh.socket${RESET}"
         fi
         $SUDO systemctl daemon-reload &>/dev/null
         local ssh_unit=""
@@ -322,6 +434,65 @@ restart_sshd() {
     fi
 }
 
+# 改端口前的占用检查：新端口若已被其它进程监听，直接拒绝修改
+check_port_available() {
+    local port="$1"
+    if command -v ss &>/dev/null; then
+        if $SUDO ss -Htuln "sport = :${port}" 2>/dev/null | grep -q .; then
+            echo -e "${ERROR} 端口 ${port} 已被占用："
+            $SUDO ss -tulpn "sport = :${port}" 2>/dev/null | tail -n +2
+            return 1
+        fi
+    elif command -v netstat &>/dev/null; then
+        if $SUDO netstat -tuln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"; then
+            echo -e "${ERROR} 端口 ${port} 已被占用。"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# 等待端口真正进入 LISTEN 状态（最多 5 秒）
+# 只重启成功不代表新端口在监听：端口被半开占用、SELinux 拦截都会出现这种情况
+wait_port_listening() {
+    local port="$1" i
+    command -v ss &>/dev/null || command -v netstat &>/dev/null || return 0
+    for i in {1..5}; do
+        if command -v ss &>/dev/null; then
+            $SUDO ss -Htuln "sport = :${port}" 2>/dev/null | grep -q . && return 0
+        else
+            $SUDO netstat -tuln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# 防火墙放行/撤销；返回 0 表示确实改动过规则，回滚时据此撤销
+open_firewall_port() {
+    local port="$1"
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        echo -e "${INFO} 正在向 ufw 防火墙放行端口 ${port}/tcp..."
+        $SUDO ufw allow "$port"/tcp >/dev/null && return 0
+    elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+        echo -e "${INFO} 正在向 firewalld 防火墙放行端口 ${port}/tcp..."
+        $SUDO firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null && \
+            $SUDO firewall-cmd --reload >/dev/null && return 0
+    fi
+    return 1
+}
+
+close_firewall_port() {
+    local port="$1"
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        $SUDO ufw delete allow "$port"/tcp >/dev/null 2>&1
+    elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+        $SUDO firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1
+        $SUDO firewall-cmd --reload >/dev/null 2>&1
+    fi
+    return 0
+}
+
 # ============ 依赖安装 ============
 check_dependencies() {
     local pkgs=()
@@ -349,6 +520,10 @@ append_key_with_meta() {
     local pub_content="$1" source_tag="$2" auth_file="${HOME}/.ssh/authorized_keys"
     local ts; ts=$(date "+%Y-%m-%d %H:%M:%S")
     init_ssh_dir
+    # 末行缺少换行符时先补一个，否则新公钥会拼到上一把密钥尾部
+    if [ -s "$auth_file" ] && [ -n "$(tail -c1 "$auth_file" 2>/dev/null)" ]; then
+        echo >> "$auth_file"
+    fi
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         line=$(echo "$line" | sed -e 's/[[:space:]]*$//')
@@ -383,10 +558,12 @@ append_key_with_meta() {
 }
 
 # 统计 authorized_keys 中有效公钥数量
+# 判定口径必须与 has_valid_pubkey 一致：只有含 ssh-/ecdsa-/sk- 的非注释行才算，
+# 否则一行乱码会让面板显示"已启用 (1 把公钥)"，同时禁用密码时又警告"没有公钥"
 count_authorized_keys() {
     local auth_file="${HOME}/.ssh/authorized_keys"
     if [ -f "$auth_file" ]; then
-        awk '!/^[[:space:]]*(#|$)/{c++} END{print c+0}' "$auth_file"
+        awk '!/^[[:space:]]*#/ && /(^|[[:space:]])(ssh-|ecdsa-|sk-)/ {c++} END{print c+0}' "$auth_file"
     else
         echo "0"
     fi
@@ -396,10 +573,15 @@ count_authorized_keys() {
 has_valid_pubkey() {
     local auth_file="${HOME}/.ssh/authorized_keys"
     [ -f "$auth_file" ] || return 1
-    grep -qE '(^|[[:space:]])(ssh-|ecdsa-|sk-)' "$auth_file" 2>/dev/null
+    # 跳过注释行，避免把 "#ssh-rsa ..." 之类的注释当成可用公钥
+    awk '!/^[[:space:]]*#/ && /(^|[[:space:]])(ssh-|ecdsa-|sk-)/ {f=1} END {exit !f}' "$auth_file" 2>/dev/null
 }
 
 # ============ Fail2Ban ============
+# Fail2Ban 客户端包装：socket 仅 root 可读，非 root + sudo 运行时必须带上 $SUDO，
+# 否则 ping/status/unban 全部失败，状态会被误判为"已停止"
+f2bc() { $SUDO fail2ban-client "$@"; }
+
 # 参数读取：优先读 [sshd] 段 → 读不到再读 [DEFAULT] 段
 # 递增参数（bantime.increment/factor/maxtime）只应在 [DEFAULT] 段生效
 get_f2b_conf() {
@@ -435,6 +617,24 @@ get_f2b_conf() {
         ' "$JAIL_CONF")
     fi
     echo "$result"
+}
+
+# 只从 [DEFAULT] 段读取（用于判断递增/数据库参数是否已存在）
+get_default_conf() {
+    local k=$1
+    [ -f "$JAIL_CONF" ] || return
+    awk -v kk="$k" '
+        BEGIN { in_block=0; result="" }
+        /^\[DEFAULT\][[:space:]]*$/ { in_block=1; next }
+        /^[[:space:]]*\[/ { in_block=0 }
+        in_block && $0 ~ "^[[:space:]]*" kk "[[:space:]]*=" {
+            value=$0
+            sub(/^[[:space:]]*[^=]+=[[:space:]]*/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            result = value
+        }
+        END { if (result != "") print result }
+    ' "$JAIL_CONF"
 }
 
 # 参数写入：
@@ -497,7 +697,7 @@ restart_f2b() {
     echo -e "${INFO} 正在重载 Fail2Ban 配置..."
     svc_restart fail2ban
     for i in {1..5}; do
-        if fail2ban-client ping >/dev/null 2>&1; then
+        if f2bc ping >/dev/null 2>&1; then
             echo -e "${INFO} ${GREEN}成功！配置已生效。${RESET}"; return 0
         fi; sleep 1
     done
@@ -509,9 +709,9 @@ get_fail2ban_status() {
     # 清命令缓存，否则 bash 会记住已被卸载的旧路径，
     # 导致 apt remove 后 command -v 仍返回旧路径、状态显示"已安装"。
     hash -r 2>/dev/null
-    if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client ping >/dev/null 2>&1; then
+    if command -v fail2ban-client >/dev/null 2>&1 && f2bc ping >/dev/null 2>&1; then
         local count
-        count=$(fail2ban-client status "$TARGET_JAIL" 2>/dev/null | grep -i "Currently banned" | awk '{print $NF}')
+        count=$(f2bc status "$TARGET_JAIL" 2>/dev/null | grep -i "Currently banned" | awk '{print $NF}')
         echo -e "${GREEN}防护中 (已封禁${count:-0} IP)${RESET}"
     elif command -v fail2ban-client >/dev/null 2>&1; then
         echo -e "${YELLOW}已安装 / 已停止${RESET}"
@@ -528,7 +728,9 @@ fmt_f2b_unit() {
 }
 
 validate_time() { [[ "$1" =~ ^[0-9]+[smhdw]?$ ]]; }
-validate_int() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
+validate_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+# fail2ban 的 bantime.factor 允许小数，maxretry 只能是整数
+validate_factor() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ ! "$1" =~ ^0(\.0+)?$ ]]; }
 
 # systemd 环境默认走 journal，不写死 logpath（避免 WARN）
 # port 动态读取当前 SSH 端口，避免装 F2B 前已改端口时防护失效
@@ -536,7 +738,9 @@ validate_int() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 generate_default_jail_conf() {
     local backend="auto"
     local logpath_line="logpath = ${SSH_LOG}"
-    if [ "$INIT_SYS" = "systemd" ]; then
+    # systemd 后端需要 python3-systemd；缺模块时回退 logpath 模式，
+    # 否则 sshd jail 会因找不到日志源而启动失败
+    if [ "$INIT_SYS" = "systemd" ] && python3 -c 'import systemd' 2>/dev/null; then
         backend="systemd"
         logpath_line=""
     fi
@@ -578,9 +782,10 @@ EOF2
 migrate_f2b_increment() {
     [ -f "$JAIL_CONF" ] || return
     local k
-    # 1. 删除 [sshd] 段内的递增参数
+    # 1. 删除 [sshd] 段内的递增参数，并把值迁移到 [DEFAULT]（不丢用户自定义）
     for k in bantime.increment bantime.factor bantime.maxtime; do
-        local sshd_has
+        local sshd_has old_val
+        old_val=$(get_f2b_conf "$k")
         sshd_has=$(awk -v t="$TARGET_JAIL" -v kk="$k" '
             BEGIN { in_block=0; found=0 }
             $0 ~ "^\\[" t "\\][[:space:]]*$" { in_block=1; next }
@@ -589,40 +794,29 @@ migrate_f2b_increment() {
             END { print found }
         ' "$JAIL_CONF")
         if [ "$sshd_has" = "1" ]; then
+            local def_val; def_val=$(get_default_conf "$k")
             $SUDO sed -i "/^\[${TARGET_JAIL}\]/,/^\[/ {/^${k}[[:space:]]*=/d}" "$JAIL_CONF"
+            # [sshd] 段里的值原本对这个 jail 生效。若 [DEFAULT] 没有、或与它不同，
+            # 都以 [sshd] 的值为准写进 [DEFAULT]，否则用户自定义会被静默改回默认值
+            if [ -n "$old_val" ] && [ "$old_val" != "$def_val" ]; then
+                set_f2b_conf "$k" "$old_val"
+            fi
         fi
     done
 
-    # 2. 检查 [DEFAULT] 段是否所有必需参数齐全（递增三参数 + 数据库两参数）
-    local need_fix=0
-    for k in bantime.increment bantime.factor bantime.maxtime dbfile dbpurgeage; do
-        local v
-        v=$(awk -v kk="$k" '
-            BEGIN { in_block=0; result="" }
-            /^\[DEFAULT\][[:space:]]*$/ { in_block=1; next }
-            /^[[:space:]]*\[/ { in_block=0 }
-            in_block && $0 ~ "^[[:space:]]*" kk "[[:space:]]*=" {
-                value=$0
-                sub(/^[[:space:]]*[^=]+=[[:space:]]*/, "", value)
-                sub(/[[:space:]]+$/, "", value)
-                result = value
-            }
-            END { if (result != "") print result }
-        ' "$JAIL_CONF")
-        [ -z "$v" ] && need_fix=1
+    # 2. 逐项补齐 [DEFAULT] 段缺失项（不覆盖用户已自定义的值）
+    local kv
+    for kv in \
+        "dbfile=/var/lib/fail2ban/fail2ban.sqlite3" \
+        "dbpurgeage=648000" \
+        "bantime.increment=true" \
+        "bantime.factor=2" \
+        "bantime.maxtime=7d"; do
+        local dk="${kv%%=*}" dv="${kv#*=}"
+        [ -n "$(get_default_conf "$dk")" ] || set_f2b_conf "$dk" "$dv"
     done
 
-    # 3. 缺失则重写 [DEFAULT] 段的全部五行配置
-    if [ "$need_fix" = "1" ]; then
-        # 先清理可能存在的旧配置
-        for k in bantime.increment bantime.factor bantime.maxtime dbfile dbpurgeage; do
-            $SUDO sed -i "/^\[DEFAULT\]/,/^\[/ {/^${k}[[:space:]]*=/d}" "$JAIL_CONF"
-        done
-        # 批量插入完整配置（注意顺序：数据库配置在前，递增配置在后）
-        $SUDO sed -i '/^\[DEFAULT\]/a dbfile = /var/lib/fail2ban/fail2ban.sqlite3\ndbpurgeage = 648000\nbantime.increment = true\nbantime.factor = 2\nbantime.maxtime = 7d' "$JAIL_CONF"
-    fi
-
-    # 4. 确保数据库目录存在且权限正确
+    # 3. 确保数据库目录存在且权限正确
     if [ ! -d "/var/lib/fail2ban" ]; then
         $SUDO mkdir -p /var/lib/fail2ban
         $SUDO chmod 755 /var/lib/fail2ban
@@ -682,7 +876,7 @@ check_f2b_install() {
         # 轮询确认服务真正就绪（首次启动可能稍慢）
         local f2b_up=0
         for i in {1..5}; do
-            if fail2ban-client ping >/dev/null 2>&1; then f2b_up=1; break; fi
+            if f2bc ping >/dev/null 2>&1; then f2b_up=1; break; fi
             sleep 1
         done
         if [ "$f2b_up" -eq 1 ]; then
@@ -755,8 +949,16 @@ check_f2b_install() {
         generate_default_jail_conf | $SUDO tee "$JAIL_CONF" > /dev/null
     else
         if ! grep -q "^\[DEFAULT\]" "$JAIL_CONF"; then
-            local be="auto"; [ "$INIT_SYS" = "systemd" ] && be="systemd"
+            local be="auto"
+            if [ "$INIT_SYS" = "systemd" ] && python3 -c 'import systemd' 2>/dev/null; then be="systemd"; fi
             $SUDO sed -i "1i [DEFAULT]\nbackend = ${be}" "$JAIL_CONF"
+        fi
+        # 老版本可能写死了 backend = systemd，但系统没有 python3-systemd 模块
+        # 时 sshd jail 起不来，这里自动回退为 logpath 模式
+        if [ "$(get_f2b_conf "backend")" = "systemd" ] && ! python3 -c 'import systemd' 2>/dev/null; then
+            echo -e "${WARN} 系统缺少 python3-systemd 模块，已回退 Fail2Ban 后端为 logpath 模式。"
+            set_f2b_conf "backend" "auto"
+            [ -n "$(get_f2b_conf "logpath")" ] || set_f2b_conf "logpath" "$SSH_LOG"
         fi
         # 迁移老配置：把 [sshd] 段错放的递增参数挪到 [DEFAULT] + 确保数据库配置存在
         migrate_f2b_increment
@@ -785,14 +987,14 @@ check_f2b_install() {
 
     if [ "$conf_hash_before" != "$conf_hash_after" ]; then
         # 配置有变化：重载或启动服务让新配置生效
-        if fail2ban-client ping >/dev/null 2>&1; then
+        if f2bc ping >/dev/null 2>&1; then
             restart_f2b
         else
             echo -e "${INFO} 检测到配置变更，正在启动 Fail2Ban..."
             svc_start fail2ban
             local f2b_up=0
             for i in {1..5}; do
-                if fail2ban-client ping >/dev/null 2>&1; then f2b_up=1; break; fi
+                if f2bc ping >/dev/null 2>&1; then f2b_up=1; break; fi
                 sleep 1
             done
             if [ "$f2b_up" -eq 1 ]; then
@@ -804,12 +1006,12 @@ check_f2b_install() {
         fi
     else
         # 配置未变化：仅做服务状态兜底，避免每次进菜单重启导致 Restore Ban 刷屏
-        if ! fail2ban-client ping >/dev/null 2>&1; then
+        if ! f2bc ping >/dev/null 2>&1; then
             echo -e "${WARN} Fail2Ban 服务未运行，正在尝试启动..."
             svc_start fail2ban
             local f2b_up=0
             for i in {1..5}; do
-                if fail2ban-client ping >/dev/null 2>&1; then f2b_up=1; break; fi
+                if f2bc ping >/dev/null 2>&1; then f2b_up=1; break; fi
                 sleep 1
             done
             if [ "$f2b_up" -eq 1 ]; then
@@ -859,7 +1061,7 @@ change_f2b_param() {
         [ -z "$new_val" ] && return
         if [ "$type" == "time" ] && validate_time "$new_val"; then break; fi
         if [ "$type" == "int" ] && validate_int "$new_val"; then break; fi
-        if [ "$type" == "factor" ] && validate_int "$new_val"; then break; fi
+        if [ "$type" == "factor" ] && validate_factor "$new_val"; then break; fi
         echo -e "${ERROR} 格式错误，请重试。"
     done
     set_f2b_conf "$key" "$new_val"; restart_f2b
@@ -867,7 +1069,7 @@ change_f2b_param() {
 
 toggle_f2b_service() {
     echo -e "\n${CYAN}------------------- 服务开关 -------------------${RESET}"
-    if fail2ban-client ping >/dev/null 2>&1; then
+    if f2bc ping >/dev/null 2>&1; then
         read -rp "是否停止并禁用 Fail2Ban? (y/N): " confirm
         [[ "$confirm" =~ ^[Yy]$ ]] && { svc_stop fail2ban; svc_disable fail2ban; echo -e "${WARN} 服务已停止。${RESET}"; }
     else
@@ -875,7 +1077,7 @@ toggle_f2b_service() {
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             svc_enable fail2ban; svc_start fail2ban
             for i in {1..5}; do
-                if fail2ban-client ping >/dev/null 2>&1; then echo -e "${INFO} ${GREEN}服务已成功启动。${RESET}"; read -rp "按回车键继续..."; return; fi; sleep 1
+                if f2bc ping >/dev/null 2>&1; then echo -e "${INFO} ${GREEN}服务已成功启动。${RESET}"; read -rp "按回车键继续..."; return; fi; sleep 1
             done
             echo -e "${ERROR} 启动失败或超时。"
         fi
@@ -886,12 +1088,15 @@ toggle_f2b_service() {
 unban_f2b_ip() {
     echo -e "\n${CYAN}------------------ 手动解封 IP ------------------${RESET}"
     local banned_list
-    banned_list=$(fail2ban-client status "$TARGET_JAIL" 2>/dev/null | grep "Banned IP list" | awk -F':' '{print $2}' | sed 's/^[ \t]*//')
+    banned_list=$(f2bc status "$TARGET_JAIL" 2>/dev/null | grep "Banned IP list" | awk -F':' '{print $2}' | sed 's/^[ \t]*//')
     [ -z "$banned_list" ] && banned_list="无"
     echo -e "当前被封禁列表: ${YELLOW}${banned_list}${RESET}"
     read -rp "输入要解封的 IP (留空取消): " target_ip; [ -z "$target_ip" ] && return
-    $SUDO fail2ban-client set "$TARGET_JAIL" unbanip "$target_ip"
-    [ $? -eq 0 ] && echo -e "${INFO} ${GREEN}解封成功: $target_ip${RESET}" || echo -e "${ERROR} 操作失败。"
+    if f2bc set "$TARGET_JAIL" unbanip "$target_ip" >/dev/null; then
+        echo -e "${INFO} ${GREEN}解封成功: $target_ip${RESET}"
+    else
+        echo -e "${ERROR} 操作失败。"
+    fi
     read -rp "按回车键继续..."
 }
 
@@ -903,7 +1108,31 @@ add_f2b_whitelist() {
     read -rp "输入要放行的 IP (回车默认当前连接 IP: ${current_ip:-无}): " input_ip
     [ -z "$input_ip" ] && input_ip="$current_ip"
     [ -z "$input_ip" ] && echo -e "${ERROR} 无法获取 IP。" && return
-    if echo "$current_list" | grep -Fq "$input_ip"; then
+    # 只接受 IPv4 / IPv4-CIDR / IPv6；写错的地址会让 fail2ban 解析失败
+    local ip_ok=0
+    if [[ "$input_ip" == *:* ]]; then
+        # IPv6：只允许十六进制与冒号（至少两个冒号，排除 "1:2" 这类半截地址），前缀 1-128
+        if [[ "$input_ip" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]] && [[ "$input_ip" == *:*:* ]] && [[ "$input_ip" != *:::* ]]; then
+            ip_ok=1
+            if [[ "$input_ip" == */* ]]; then
+                local _pfx="${input_ip#*/}"
+                { [ "$_pfx" -ge 1 ] && [ "$_pfx" -le 128 ]; } 2>/dev/null || ip_ok=0
+            fi
+        fi
+    elif [[ "$input_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+        ip_ok=1
+        local _seg _o
+        IFS='.' read -r -a _seg <<< "${input_ip%%/*}"
+        for _o in "${_seg[@]}"; do [ "$_o" -le 255 ] 2>/dev/null || ip_ok=0; done
+        if [[ "$input_ip" == */* ]] && [ "${input_ip#*/}" -gt 32 ] 2>/dev/null; then ip_ok=0; fi
+    fi
+    if [ "$ip_ok" -eq 0 ]; then
+        echo -e "${ERROR} IP 格式不正确，仅支持 IPv4 / IPv4-CIDR / IPv6。"
+        read -rp "按回车键继续..."
+        return
+    fi
+    # 精确匹配，避免 1.1.1.1 被 11.1.1.10 误判为已存在
+    if echo "$current_list" | tr ' ' '\n' | grep -qxF "$input_ip"; then
         echo -e "${WARN} 该 IP 已在白名单中。"
     else
         if [ -z "$current_list" ]; then set_f2b_conf "ignoreip" "$input_ip"
@@ -918,20 +1147,21 @@ view_f2b_logs() {
     echo -e "${CYAN}============================================================${RESET}"
     echo -e "${BOLD}${PURPLE}                 Fail2Ban 审计日志 (最近 20 条)${RESET}"
     echo -e "${CYAN}============================================================${RESET}"
-    if [ ! -f "$LOG_FILE" ]; then
-        echo -e "${WARN} 日志文件不存在: $LOG_FILE"
-    else
-        local out
+    local out=""
+    if [ -f "$LOG_FILE" ]; then
         out=$(grep -E "(Ban|Unban)" "$LOG_FILE" 2>/dev/null | tail -n 20)
-        if [ -z "$out" ]; then
-            echo -e "${WARN} 暂无封禁/解封记录${RESET}"
-        else
-            echo "$out" | awk '{
-                gsub(/Unban/, "\033[32m&\033[0m");
-                gsub(/Ban/, "\033[31m&\033[0m");
-                print
-            }'
-        fi
+    elif command -v journalctl &>/dev/null; then
+        # backend = systemd 时日志进 journal，没有 /var/log/fail2ban.log
+        out=$($SUDO journalctl -u fail2ban --no-pager -n 300 2>/dev/null | grep -E "(Ban|Unban)" | tail -n 20)
+    fi
+    if [ -z "$out" ]; then
+        echo -e "${WARN} 暂无封禁/解封记录${RESET}"
+    else
+        echo "$out" | awk '{
+            gsub(/Unban/, "\033[32m&\033[0m");
+            gsub(/Ban/, "\033[31m&\033[0m");
+            print
+        }'
     fi
     echo -e "${CYAN}============================================================${RESET}"
     read -rp "按回车键返回..."
@@ -944,22 +1174,24 @@ menu_f2b_exponential() {
         inc=$(get_f2b_conf "bantime.increment")
         fac=$(get_f2b_conf "bantime.factor")
         max=$(get_f2b_conf "bantime.maxtime")
-        local S_INC; [ "$inc" == "true" ] && S_INC="${GREEN}启用${RESET}" || S_INC="${YELLOW}禁用${RESET}"
+        local S_INC; [ "${inc,,}" == "true" ] && S_INC="${GREEN}启用${RESET}" || S_INC="${YELLOW}禁用${RESET}"
         echo -e "${CYAN}============================================================${RESET}"
         echo -e "${BOLD}${PURPLE}            高级: 指数封禁设置 (针对 sshd)${RESET}"
         echo -e "${CYAN}============================================================${RESET}"
         echo -e " 说明: 对重复犯错的恶意 IP，封禁时间按设定系数成倍递增"
         echo -e "${CYAN}------------------------------------------------------------${RESET}"
         echo -e "  ${GREEN}1.${RESET} 递增模式开关   [${S_INC}]"
-        echo -e "  ${GREEN}2.${RESET} 增长系数       [${YELLOW}${fac:-未设置}${RESET}]$(fmt_f2b_unit "$fac" "factor")"
-        echo -e "  ${GREEN}3.${RESET} 封禁上限       [${YELLOW}${max:-未设置}${RESET}]$(fmt_f2b_unit "$max" "time")"
+        echo -e "  ${GREEN}2.${RESET} 增长系数       [${YELLOW}$(fmt_f2b_unit "${fac:-未设置}" "factor")${RESET}]"
+        echo -e "  ${GREEN}3.${RESET} 封禁上限       [${YELLOW}$(fmt_f2b_unit "${max:-未设置}" "time")${RESET}]"
         echo -e "${CYAN}------------------------------------------------------------${RESET}"
         echo -e "  ${GREEN}0.${RESET} 返回上级"
         echo -e "${CYAN}============================================================${RESET}"
         echo -e "${GRAY}提示: 输入对应序号后可自定义该参数${RESET}"
-        read -rp "请选择 [0-3]: " sc
+        if ! read -rp "请选择 [0-3]: " sc; then
+            echo; return
+        fi
         case "$sc" in
-            1) [ "$inc" == "true" ] && ns="false" || ns="true"; set_f2b_conf "bantime.increment" "$ns"; restart_f2b ;;
+            1) [ "${inc,,}" == "true" ] && ns="false" || ns="true"; set_f2b_conf "bantime.increment" "$ns"; restart_f2b ;;
             2) change_f2b_param "增长系数 (倍数)" "bantime.factor" "factor" ;;
             3) change_f2b_param "封禁上限 (时间)" "bantime.maxtime" "time" ;;
             0) return ;;
@@ -979,8 +1211,8 @@ manage_fail2ban_menu() {
         echo -e "  服务状态: $(get_fail2ban_status)"
         echo -e "${CYAN}------------------------------------------------------------${RESET}"
         echo -e "  ${GREEN}1.${RESET} 最大重试次数     [${YELLOW}${VAL_MAX:-默认}${RESET}]"
-        echo -e "  ${GREEN}2.${RESET} 初始封禁时长     [${YELLOW}${VAL_BAN:-默认}${RESET}]$(fmt_f2b_unit "$VAL_BAN" "time")"
-        echo -e "  ${GREEN}3.${RESET} 监测时间窗口     [${YELLOW}${VAL_FIND:-默认}${RESET}]$(fmt_f2b_unit "$VAL_FIND" "time")"
+        echo -e "  ${GREEN}2.${RESET} 初始封禁时长     [${YELLOW}$(fmt_f2b_unit "${VAL_BAN:-默认}" "time")${RESET}]"
+        echo -e "  ${GREEN}3.${RESET} 监测时间窗口     [${YELLOW}$(fmt_f2b_unit "${VAL_FIND:-默认}" "time")${RESET}]"
         echo -e "${CYAN}------------------------------------------------------------${RESET}"
         echo -e "  ${GREEN}4.${RESET} 手动解封 IP"
         echo -e "  ${GREEN}5.${RESET} 添加 IP 白名单"
@@ -991,7 +1223,9 @@ manage_fail2ban_menu() {
         echo -e "  ${GREEN}9.${RESET} 卸载 Fail2Ban"
         echo -e "  ${GREEN}0.${RESET} 返回主菜单"
         echo -e "${CYAN}============================================================${RESET}"
-        read -rp "请选择 [0-9]: " choice
+        if ! read -rp "请选择 [0-9]: " choice; then
+            echo; return
+        fi
         case "$choice" in
             1) change_f2b_param "最大重试次数" "maxretry" "int" ;;
             2) change_f2b_param "初始封禁时长" "bantime" "time" ;;
@@ -1120,8 +1354,11 @@ toggle_pubkey_login() {
         read -rp "是否要启用密钥登录？(y/N): " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             set_sshd_config "PubkeyAuthentication" "yes"
-            restart_sshd
-            echo -e "${INFO} ${GREEN}密钥登录已成功启用。${RESET}"
+            if restart_sshd; then
+                echo -e "${INFO} ${GREEN}密钥登录已成功启用。${RESET}"
+            else
+                echo -e "${ERROR} 配置已写入，但 SSH 服务未能重启。请先用新终端验证，再关闭当前窗口！"
+            fi
         fi
     else
         echo -e "\n${YELLOW}${BOLD}[警告] 禁用密钥登录后，如果密码登录也已禁用，你将无法登录 VPS！${RESET}"
@@ -1141,8 +1378,11 @@ toggle_pubkey_login() {
         fi
 
         set_sshd_config "PubkeyAuthentication" "no"
-        restart_sshd
-        echo -e "${INFO} ${GREEN}密钥登录已禁用，现在只能通过密码登录。${RESET}"
+        if restart_sshd; then
+            echo -e "${INFO} ${GREEN}密钥登录已禁用，现在只能通过密码登录。${RESET}"
+        else
+            echo -e "${ERROR} 配置已写入，但 SSH 服务未能重启。请先用新终端验证，再关闭当前窗口！"
+        fi
     fi
     read -rp "按回车键继续..."
 }
@@ -1184,7 +1424,9 @@ install_key_menu() {
         echo -e "  ${GREEN}5.${RESET} 密钥登录开关 ${pubkey_label}"
         echo -e "  ${GREEN}0.${RESET} 返回主菜单"
         echo -e "${CYAN}============================================================${RESET}"
-        read -rp "请输入选项 [0-5]: " key_opt
+        if ! read -rp "请输入选项 [0-5]: " key_opt; then
+            echo; return
+        fi
 
         local test_hint=""
         local do_restart=0
@@ -1201,7 +1443,7 @@ install_key_menu() {
                 fi
                 echo -e "${INFO} 正在从 GitHub 拉取公钥..."
                 local pub_key
-                pub_key=$(curl -fsSL "https://github.com/${gh_user}.keys")
+                pub_key=$(curl -fsSL --max-time 15 "https://github.com/${gh_user}.keys")
                 if [ -z "$pub_key" ] || [[ "$pub_key" == "Not Found" ]]; then
                     echo -e "\n${ERROR} 获取公钥失败！可能是用户名不正确，或该 GitHub 账号未配置公钥。"
                     echo -e "${CYAN}------------------------------------------------------------${RESET}"
@@ -1232,8 +1474,13 @@ install_key_menu() {
                     read -rp "按回车键继续..."
                     continue
                 fi
+                if [[ ! "$key_url" =~ ^https?:// ]]; then
+                    echo -e "${ERROR} URL 必须以 http:// 或 https:// 开头！"
+                    read -rp "按回车键继续..."
+                    continue
+                fi
                 local pub_key
-                pub_key=$(curl -fsSL "$key_url")
+                pub_key=$(curl -fsSL --max-time 15 -- "$key_url")
                 if [ -z "$pub_key" ]; then
                     echo -e "${ERROR} 从 URL 获取公钥失败！"
                     read -rp "按回车键继续..."
@@ -1261,7 +1508,11 @@ install_key_menu() {
 
         if [ "$do_restart" == "1" ]; then
             set_sshd_config "PubkeyAuthentication" "yes"
-            restart_sshd
+            if ! restart_sshd; then
+                echo -e "${ERROR} SSH 服务未能重启，配置已写入。请先用新终端验证再关闭当前窗口！"
+                read -rp "按回车键返回密钥管理子菜单..."
+                continue
+            fi
             echo -e "\n${CYAN}------------------------------------------------------------${RESET}"
             echo -e "${YELLOW}${BOLD}[重点测试]${RESET} ${test_hint}"
             echo -e "测试成功后，再返回主菜单【禁用密码登录】！"
@@ -1335,13 +1586,16 @@ manage_keys_menu() {
         echo -e " 输入 ${RED}[all]${RESET}  : 清空全部公钥"
         echo -e " 输入 ${GREEN}[0]${RESET}    : 返回上级菜单"
         echo -e "${CYAN}============================================================${RESET}"
-        read -rp "请输入操作指令: " key_action
+        if ! read -rp "请输入操作指令: " key_action; then
+            echo; return
+        fi
 
         if [ "$key_action" == "0" ]; then
             return
         elif [ "$key_action" == "all" ]; then
-            # 危险检查：密码登录已禁用时清空全部公钥会锁死
-            if [[ "$(get_sshd_config_val "PasswordAuthentication" "yes")" == "no" ]]; then
+            # 危险检查：密码登录已禁用时清空全部公钥会锁死（大小写不敏感）
+            local pwd_state; pwd_state=$(get_sshd_config_val "PasswordAuthentication" "yes")
+            if [[ "${pwd_state,,}" == "no" ]]; then
                 echo -e "${RED}${BOLD}[危险] 密码登录已禁用，清空全部公钥后你将无法登录此 VPS！${RESET}"
                 read -rp "确认仍然要清空吗？(y/N): " risky_all
                 [[ ! "$risky_all" =~ ^[Yy]$ ]] && continue
@@ -1357,8 +1611,9 @@ manage_keys_menu() {
             local target_idx=$((key_action - 1))
             local target_line_num="${key_lines[$target_idx]}"
 
-            # 危险检查：密码登录已禁用 + 只剩最后一个公钥时删除会锁死
-            if [[ "$(get_sshd_config_val "PasswordAuthentication" "yes")" == "no" ]] && [ "${#key_contents[@]}" -eq 1 ]; then
+            # 危险检查：密码登录已禁用 + 只剩最后一个公钥时删除会锁死（大小写不敏感）
+            local pwd_state2; pwd_state2=$(get_sshd_config_val "PasswordAuthentication" "yes")
+            if [[ "${pwd_state2,,}" == "no" ]] && [ "${#key_contents[@]}" -eq 1 ]; then
                 echo -e "${RED}${BOLD}[危险] 密码登录已禁用，删除最后一个公钥后你将无法登录此 VPS！${RESET}"
                 read -rp "确认仍然要删除吗？(y/N): " risky_del
                 [[ ! "$risky_del" =~ ^[Yy]$ ]] && continue
@@ -1390,7 +1645,11 @@ toggle_password_login() {
         read -rp "是否要启用密码登录？(y/N): " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             set_sshd_config "PasswordAuthentication" "yes"
-            restart_sshd
+            if ! restart_sshd; then
+                echo -e "${ERROR} 配置已写入，但 SSH 服务未能重启。请先用新终端验证，再关闭当前窗口！"
+                read -rp "按回车键返回主菜单..."
+                return
+            fi
             echo -e "${INFO} 已成功启用密码登录。"
 
             read -rp "是否需要为当前用户 ($(whoami)) 设置新密码？(y/N): " pwd_confirm
@@ -1423,8 +1682,11 @@ toggle_password_login() {
             set_sshd_config "PasswordAuthentication" "no"
             set_sshd_config "ChallengeResponseAuthentication" "no"
             set_sshd_config "KbdInteractiveAuthentication" "no"
-            restart_sshd
-            echo -e "${INFO} ${GREEN}密码登录已成功禁用！现在只能通过密钥登录。${RESET}"
+            if restart_sshd; then
+                echo -e "${INFO} ${GREEN}密码登录已成功禁用！现在只能通过密钥登录。${RESET}"
+            else
+                echo -e "${ERROR} 配置已写入，但 SSH 服务未能重启。请先用控制台检查，切勿断开连接！"
+            fi
         fi
     fi
     read -rp "按回车键返回主菜单..."
@@ -1438,10 +1700,23 @@ change_ssh_port() {
     if [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
         echo -e "${YELLOW}${BOLD}[提示] 检测到您正在使用 SSH 远程会话，修改端口后请勿关闭当前窗口，请先新建终端验证！${RESET}"
     fi
-    read -rp "请输入新的 SSH 端口 (1024-65535): " new_port
+    read -rp "请输入新的 SSH 端口 (1-65535): " new_port
 
     if [[ ! "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
         echo -e "${ERROR} 端口格式不正确！"
+        read -rp "按回车键返回主菜单..."
+        return
+    fi
+
+    if [ "$new_port" = "$current_port" ]; then
+        echo -e "${WARN} 新端口与当前端口相同，无需修改。"
+        read -rp "按回车键返回主菜单..."
+        return
+    fi
+
+    # 先确认端口没被别的进程占用，避免改完重启起不来
+    if ! check_port_available "$new_port"; then
+        echo -e "${YELLOW}请换一个端口，或先停止占用该端口的服务。${RESET}"
         read -rp "按回车键返回主菜单..."
         return
     fi
@@ -1456,24 +1731,28 @@ change_ssh_port() {
         fi
     fi
 
-    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
-        echo -e "${INFO} 正在向 ufw 防火墙放行端口 ${new_port}/tcp..."
-        $SUDO ufw allow "$new_port"/tcp >/dev/null
-    elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
-        echo -e "${INFO} 正在向 firewalld 防火墙放行端口 ${new_port}/tcp..."
-        $SUDO firewall-cmd --permanent --add-port="${new_port}/tcp" >/dev/null
-        $SUDO firewall-cmd --reload >/dev/null
-    fi
+    local fw_opened=0
+    open_firewall_port "$new_port" && fw_opened=1
 
     set_sshd_config "Port" "$new_port"
+    MASK_SSH_SOCKET=1
 
+    local port_ok=0
     if restart_sshd; then
+        if wait_port_listening "$new_port"; then
+            port_ok=1
+        else
+            echo -e "${ERROR} SSH 已重启，但 ${new_port} 端口没有在监听，按失败处理。"
+        fi
+    fi
+
+    if [ "$port_ok" -eq 1 ]; then
         echo -e "${INFO} ${GREEN}SSH 端口已顺利修改为 ${new_port}${RESET}"
 
         # 同步更新 Fail2Ban 端口
         if [ -f "$JAIL_CONF" ] && grep -q "^\[${TARGET_JAIL}\]" "$JAIL_CONF"; then
             set_f2b_conf "port" "$new_port"
-            if command -v fail2ban-client &>/dev/null && fail2ban-client ping >/dev/null 2>&1; then
+            if command -v fail2ban-client &>/dev/null && f2bc ping >/dev/null 2>&1; then
                 echo -e "${INFO} 正在同步更新 Fail2Ban 防护端口..."
                 restart_f2b
             fi
@@ -1484,6 +1763,24 @@ change_ssh_port() {
             ss -tulpn | grep ssh || true
         fi
         echo -e "${WARN} 注意：如使用的是阿里云/腾讯云/AWS等，请务必在【云服务器安全组】中开放 TCP ${new_port} 端口！"
+    else
+        echo -e "${ERROR} SSH 服务未能按新端口 ${new_port} 启动，正在回滚到原端口 ${current_port}..."
+        set_sshd_config "Port" "$current_port"
+        MASK_SSH_SOCKET=1
+        # Fail2Ban 的 port 也不能留在新端口上，否则防护会盯着一个没人监听的端口
+        if [ -f "$JAIL_CONF" ] && grep -q "^\[${TARGET_JAIL}\]" "$JAIL_CONF"; then
+            set_f2b_conf "port" "$current_port"
+        fi
+        # 防火墙规则也撤销，避免留下一个永久放行却没人用的端口
+        [ "$fw_opened" -eq 1 ] && close_firewall_port "$new_port"
+        if restart_sshd; then
+            echo -e "${WARN} 已回滚到原端口 ${current_port}，当前连接安全。请检查新端口为何不可用。"
+            if command -v fail2ban-client &>/dev/null && f2bc ping >/dev/null 2>&1; then
+                restart_f2b
+            fi
+        else
+            echo -e "${ERROR} 回滚也失败了！请立即通过云控制台/VNC 进入，把 ${SSHD_MAIN} 中的 Port 改回 ${current_port} 后重启 sshd。"
+        fi
     fi
 
     read -rp "按回车键返回主菜单..."
@@ -1491,7 +1788,6 @@ change_ssh_port() {
 
 # ============ 主逻辑 ============
 detect_os; detect_pkg_mgr; detect_init; detect_ssh_log
-check_dependencies
 
 # ============ 命令行参数解析 ============
 # 先收集所有参数，循环结束后按依赖顺序统一执行
@@ -1502,7 +1798,7 @@ CLI_KEY_FILE=""
 CLI_PORT=""
 CLI_DISABLE_PWD=0
 
-while getopts "og:u:f:p:d" OPT; do
+while getopts "og:u:f:p:dh" OPT; do
     case $OPT in
         o) OVERWRITE=1 ;;
         g) CLI_GH_USER="$OPTARG" ;;
@@ -1510,9 +1806,15 @@ while getopts "og:u:f:p:d" OPT; do
         f) CLI_KEY_FILE="$OPTARG" ;;
         p) CLI_PORT="$OPTARG" ;;
         d) CLI_DISABLE_PWD=1 ;;
-        *) exit 1 ;;
+        h) show_help; exit 0 ;;
+        *) show_help; exit 1 ;;
     esac
 done
+
+# 后续所有操作都要改系统配置，这里统一拦一次
+# 必须排在 check_dependencies 之前：装依赖也要 sudo，先确认能提权
+require_privilege
+check_dependencies
 
 # -o 必须配合公钥来源使用，否则会误清空 authorized_keys
 if [ "$OVERWRITE" -eq 1 ] && [ -z "$CLI_GH_USER" ] && [ -z "$CLI_KEY_URL" ] && [ -z "$CLI_KEY_FILE" ]; then
@@ -1527,37 +1829,61 @@ if [ -n "$CLI_GH_USER" ] || [ -n "$CLI_KEY_URL" ] || [ -n "$CLI_KEY_FILE" ] || \
 
     need_restart_sshd=0
     need_restart_f2b=0
+    fw_opened=0
 
-    if [ -n "$CLI_GH_USER" ] || [ -n "$CLI_KEY_URL" ] || [ -n "$CLI_KEY_FILE" ]; then
-        init_ssh_dir
-        [ "$OVERWRITE" == "1" ] && > "${HOME}/.ssh/authorized_keys"
-    fi
-
-    # 1. 导入公钥
+    # 1. 先把所有公钥来源取回并校验，全部成功后才动 authorized_keys。
+    #    避免 -o 先清空、拉取却失败，留下空 authorized_keys 导致锁死。
+    FETCH_GH=""; FETCH_URL=""; FETCH_FILE=""
     if [ -n "$CLI_GH_USER" ]; then
-        PUB_KEY=$(curl -fsSL "https://github.com/${CLI_GH_USER}.keys")
-        [ -z "$PUB_KEY" ] && echo -e "${ERROR} 获取 GitHub 公钥失败" && exit 1
-        append_key_with_meta "$PUB_KEY" "GitHub: ${CLI_GH_USER}"
-        set_sshd_config "PubkeyAuthentication" "yes"
-        need_restart_sshd=1
+        FETCH_GH=$(curl -fsSL --max-time 15 "https://github.com/${CLI_GH_USER}.keys")
+        if [ -z "$FETCH_GH" ]; then
+            echo -e "${ERROR} 获取 GitHub 公钥失败（用户名有误、账号无公钥或网络不通），authorized_keys 未改动。"
+            exit 1
+        fi
     fi
 
     if [ -n "$CLI_KEY_URL" ]; then
-        PUB_KEY=$(curl -fsSL "${CLI_KEY_URL}")
-        [ -z "$PUB_KEY" ] && echo -e "${ERROR} 从 URL 获取公钥失败" && exit 1
-        append_key_with_meta "$PUB_KEY" "自定义URL"
-        set_sshd_config "PubkeyAuthentication" "yes"
-        need_restart_sshd=1
+        if [[ ! "$CLI_KEY_URL" =~ ^https?:// ]]; then
+            echo -e "${ERROR} URL 必须以 http:// 或 https:// 开头，authorized_keys 未改动。"
+            exit 1
+        fi
+        FETCH_URL=$(curl -fsSL --max-time 15 -- "$CLI_KEY_URL")
+        if [ -z "$FETCH_URL" ]; then
+            echo -e "${ERROR} 从 URL 获取公钥失败，authorized_keys 未改动。"
+            exit 1
+        fi
     fi
 
     if [ -n "$CLI_KEY_FILE" ]; then
-        if [ -f "${CLI_KEY_FILE}" ]; then
-            PUB_KEY=$(cat "${CLI_KEY_FILE}")
-            append_key_with_meta "$PUB_KEY" "本地文件导入"
+        if [ ! -f "$CLI_KEY_FILE" ] || [ ! -r "$CLI_KEY_FILE" ]; then
+            echo -e "${ERROR} 找不到或无法读取公钥文件 ${CLI_KEY_FILE}，authorized_keys 未改动。"
+            exit 1
+        fi
+        FETCH_FILE=$(cat "$CLI_KEY_FILE")
+        if [ -z "$FETCH_FILE" ]; then
+            echo -e "${ERROR} 公钥文件内容为空，authorized_keys 未改动。"
+            exit 1
+        fi
+    fi
+
+    # 2. 全部校验通过，此时才允许清空（-o）并写入
+    if [ -n "$FETCH_GH" ] || [ -n "$FETCH_URL" ] || [ -n "$FETCH_FILE" ]; then
+        init_ssh_dir
+        if [ "$OVERWRITE" -eq 1 ]; then > "${HOME}/.ssh/authorized_keys"; fi
+        if [ -n "$FETCH_GH" ]; then
+            append_key_with_meta "$FETCH_GH" "GitHub: ${CLI_GH_USER}"
             set_sshd_config "PubkeyAuthentication" "yes"
             need_restart_sshd=1
-        else
-            echo -e "${ERROR} 找不到公钥文件 ${CLI_KEY_FILE}" && exit 1
+        fi
+        if [ -n "$FETCH_URL" ]; then
+            append_key_with_meta "$FETCH_URL" "自定义URL"
+            set_sshd_config "PubkeyAuthentication" "yes"
+            need_restart_sshd=1
+        fi
+        if [ -n "$FETCH_FILE" ]; then
+            append_key_with_meta "$FETCH_FILE" "本地文件导入"
+            set_sshd_config "PubkeyAuthentication" "yes"
+            need_restart_sshd=1
         fi
     fi
 
@@ -1565,6 +1891,12 @@ if [ -n "$CLI_GH_USER" ] || [ -n "$CLI_KEY_URL" ] || [ -n "$CLI_KEY_FILE" ] || \
     if [ -n "$CLI_PORT" ]; then
         if [[ ! "$CLI_PORT" =~ ^[0-9]+$ ]] || [ "$CLI_PORT" -lt 1 ] || [ "$CLI_PORT" -gt 65535 ]; then
             echo -e "${ERROR} 端口格式不正确！" && exit 1
+        fi
+
+        # 端口已被占用时直接拒绝，避免改完重启起不来
+        if ! check_port_available "$CLI_PORT"; then
+            echo -e "${YELLOW}请换一个端口，或先停止占用该端口的服务。${RESET}"
+            exit 1
         fi
 
         if command -v getenforce &>/dev/null && [ "$(getenforce)" != "Disabled" ]; then
@@ -1577,18 +1909,13 @@ if [ -n "$CLI_GH_USER" ] || [ -n "$CLI_KEY_URL" ] || [ -n "$CLI_KEY_FILE" ] || \
             fi
         fi
 
-        if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
-            echo -e "${INFO} 正在向 ufw 防火墙放行端口 ${CLI_PORT}/tcp..."
-            $SUDO ufw allow "$CLI_PORT"/tcp >/dev/null
-        elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
-            echo -e "${INFO} 正在向 firewalld 防火墙放行端口 ${CLI_PORT}/tcp..."
-            $SUDO firewall-cmd --permanent --add-port="${CLI_PORT}/tcp" >/dev/null
-            $SUDO firewall-cmd --reload >/dev/null
-        fi
+        fw_opened=0
+        open_firewall_port "$CLI_PORT" && fw_opened=1
 
-        # 先删除主文件里的旧 Port（避免同时监听多个端口）
-        $SUDO sed -i -E '/^[[:space:]]*Port[[:space:]=]/d' /etc/ssh/sshd_config
+        CLI_OLD_PORT=$(get_sshd_config_val "Port" "22")
+        [ -z "$CLI_OLD_PORT" ] && CLI_OLD_PORT="22"
         set_sshd_config "Port" "$CLI_PORT"
+        MASK_SSH_SOCKET=1
         need_restart_sshd=1
 
         if [ -f "$JAIL_CONF" ] && grep -q "^\[${TARGET_JAIL}\]" "$JAIL_CONF"; then
@@ -1599,8 +1926,8 @@ if [ -n "$CLI_GH_USER" ] || [ -n "$CLI_KEY_URL" ] || [ -n "$CLI_KEY_FILE" ] || \
 
     # 3. 禁用密码登录（危险检查）
     if [ "$CLI_DISABLE_PWD" -eq 1 ]; then
-        if ! has_valid_pubkey || \
-           [[ "$(get_sshd_config_val "PubkeyAuthentication" "yes")" != "yes" ]]; then
+        local_pubkey_state="$(get_sshd_config_val "PubkeyAuthentication" "yes")"
+        if ! has_valid_pubkey || [[ "${local_pubkey_state,,}" != "yes" ]]; then
             echo -e "${ERROR} 密钥登录不可用（未启用或无公钥），禁用密码登录将导致你无法登录！"
             read -rp "确认仍然执行？(y/N): " confirm
             [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 1
@@ -1613,7 +1940,17 @@ if [ -n "$CLI_GH_USER" ] || [ -n "$CLI_KEY_URL" ] || [ -n "$CLI_KEY_FILE" ] || \
 
     # 统一重启 SSH 服务
     if [ "$need_restart_sshd" -eq 1 ]; then
+        # 重启成功不等于新端口可用：这里再确认端口真的在监听
+        cli_ok=0
         if restart_sshd; then
+            if [ -n "$CLI_PORT" ] && ! wait_port_listening "$CLI_PORT"; then
+                echo -e "${ERROR} SSH 已重启，但 ${CLI_PORT} 端口没有在监听，按失败处理。"
+            else
+                cli_ok=1
+            fi
+        fi
+
+        if [ "$cli_ok" -eq 1 ]; then
             if [ -n "$CLI_PORT" ]; then
                 if command -v ss &>/dev/null; then
                     echo -e "${INFO} 系统实际监听服务端口状态："
@@ -1621,12 +1958,36 @@ if [ -n "$CLI_GH_USER" ] || [ -n "$CLI_KEY_URL" ] || [ -n "$CLI_KEY_FILE" ] || \
                 fi
                 echo -e "${WARN} 注意：如使用的是阿里云/腾讯云/AWS等，请务必在【云服务器安全组】中开放 TCP ${CLI_PORT} 端口！"
             fi
+        else
+            echo -e "${ERROR} SSH 服务未能按新配置运行，配置已写入。"
+            if [ -n "$CLI_PORT" ]; then
+                echo -e "${WARN} 正在回滚到原端口 ${CLI_OLD_PORT}..."
+                set_sshd_config "Port" "$CLI_OLD_PORT"
+                MASK_SSH_SOCKET=1
+                # Fail2Ban 端口一并回滚，否则会守着 sshd 不再监听的新端口，防护静默失效
+                if [ -f "$JAIL_CONF" ] && grep -q "^\[${TARGET_JAIL}\]" "$JAIL_CONF"; then
+                    set_f2b_conf "port" "$CLI_OLD_PORT"
+                fi
+                # 已放行的防火墙端口也收回，避免留下永久开放却无人使用的端口
+                [ "$fw_opened" -eq 1 ] && close_firewall_port "$CLI_PORT"
+                if restart_sshd; then
+                    echo -e "${WARN} 已回滚到原端口 ${CLI_OLD_PORT}，当前连接安全。"
+                    if command -v fail2ban-client &>/dev/null && f2bc ping >/dev/null 2>&1; then
+                        restart_f2b
+                    fi
+                else
+                    echo -e "${ERROR} 回滚也失败！请立即通过云控制台/VNC 进入，把 ${SSHD_MAIN} 中的 Port 改回 ${CLI_OLD_PORT} 后重启 sshd。"
+                fi
+            else
+                echo -e "${WARN} 请执行 sshd -t 检查配置，或用 journalctl -u ssh / tail -n 50 /var/log/auth.log 查看失败原因。"
+            fi
+            exit 1
         fi
     fi
 
     # 同步重启 Fail2Ban
     if [ "$need_restart_f2b" -eq 1 ]; then
-        if command -v fail2ban-client &>/dev/null && fail2ban-client ping >/dev/null 2>&1; then
+        if command -v fail2ban-client &>/dev/null && f2bc ping >/dev/null 2>&1; then
             echo -e "${INFO} 正在同步更新 Fail2Ban 防护端口..."
             restart_f2b
         fi
@@ -1636,6 +1997,12 @@ if [ -n "$CLI_GH_USER" ] || [ -n "$CLI_KEY_URL" ] || [ -n "$CLI_KEY_FILE" ] || \
 fi
 
 # ============ 交互式主菜单 ============
+# stdin 不是终端时（如 CI、< /dev/null）read 会立刻返回，会导致菜单无限刷新
+if [ ! -t 0 ]; then
+    echo -e "${ERROR} 交互模式需要在终端中运行。查看命令行用法：$(basename "$0") -h"
+    exit 1
+fi
+
 while true; do
     clear
     show_status
@@ -1645,7 +2012,9 @@ while true; do
     echo -e " ${GREEN}4.${RESET} SSH 端口修改"
     echo -e " ${GREEN}0.${RESET} 退出脚本"
     echo -e "${CYAN}============================================================${RESET}"
-    read -rp "请输入选项 [0-4]: " choice
+    if ! read -rp "请输入选项 [0-4]: " choice; then
+        echo; exit 0
+    fi
 
     case "$choice" in
         1) install_key_menu ;;
